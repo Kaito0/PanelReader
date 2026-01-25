@@ -75,7 +75,7 @@ function PanelZoomIntegration:nextPanel()
     self._is_switching = true
     
     -- Reset the flag after the UI has had a chance to breathe
-    UIManager:scheduleIn(0.1, function() self._is_switching = false end)
+    UIManager:scheduleIn(0.3, function() self._is_switching = false end)
     
     -- Check if we have preloaded the next panel
     if self._preloaded_image and self._preloaded_panel_index == self.current_panel_index + 1 then
@@ -101,7 +101,7 @@ function PanelZoomIntegration:prevPanel()
     self._is_switching = true
     
     -- Reset the flag after the UI has had a chance to breathe
-    UIManager:scheduleIn(0.1, function() self._is_switching = false end)
+    UIManager:scheduleIn(0.3, function() self._is_switching = false end)
     
     if self.current_panel_index > 1 then
         self.current_panel_index = self.current_panel_index - 1
@@ -580,9 +580,9 @@ function PanelZoomIntegration:displayCurrentPanel()
     
     logger.info("PanelZoom: Successfully created panel image with document settings")
 
-    -- Check if we're updating an existing viewer or creating a new one
+    -- ALWAYS prioritize updating the existing instance for smooth transitions
     if self._current_imgviewer then
-        -- Update existing viewer to avoid flicker
+        -- Update existing viewer to avoid flicker and maintain state
         logger.info("PanelZoom: Updating existing ImageViewer")
         
         -- Explicitly free old image memory for safety
@@ -593,6 +593,18 @@ function PanelZoomIntegration:displayCurrentPanel()
             logger.info("PanelZoom: Explicitly freed old image memory")
         end
         
+        -- Ensure the ImageViewer has proper dimen for the new image
+        if image and image.w and image.h then
+            self._current_imgviewer.dimen = Geom:new{
+                x = 0,
+                y = 0,
+                w = image.w,
+                h = image.h
+            }
+            logger.info(string.format("PanelZoom: Updated ImageViewer dimen to %dx%d", image.w, image.h))
+        end
+        
+        -- Update the viewer and mark for repaint
         self._current_imgviewer:update()
         UIManager:setDirty(self._current_imgviewer, "ui")
         
@@ -600,9 +612,12 @@ function PanelZoomIntegration:displayCurrentPanel()
         UIManager:scheduleIn(0.2, function()
             self:preloadNextPanel()
         end)
+        
+        logger.info("PanelZoom: Successfully updated existing ImageViewer")
+        return true -- Success, existing viewer updated
     else
-        -- Create new viewer
-        logger.info("PanelZoom: Creating PanelViewer instance")
+        -- Only create new viewer if absolutely necessary
+        logger.info("PanelZoom: Creating new PanelViewer instance (no existing viewer)")
         local imgviewer = PanelViewer:new{
             image = image,
             image_disposable = false, -- Don't dispose memory at all
@@ -616,14 +631,16 @@ function PanelZoomIntegration:displayCurrentPanel()
         }
         
         self._current_imgviewer = imgviewer
-        logger.info("PanelZoom: Showing ImageViewer")
+        logger.info("PanelZoom: Showing new ImageViewer")
         UIManager:show(imgviewer)
-        logger.info("PanelZoom: ImageViewer shown successfully")
+        logger.info("PanelZoom: New ImageViewer shown successfully")
         
         -- Start preloading the next panel after a short delay
         UIManager:scheduleIn(0.2, function()
             self:preloadNextPanel()
         end)
+        
+        return true -- Success, new viewer created
     end
     
     return true
