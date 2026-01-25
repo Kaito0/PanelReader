@@ -20,6 +20,9 @@ local PanelZoomIntegration = WidgetContainer:extend{
     last_page_seen = -1,
     tap_navigation_enabled = true,
     tap_zones = { left = 0.3, right = 0.7 },
+    _panel_cache = {}, -- Cache JSON per document
+    _preloaded_image = nil, -- Pre-rendered next panel
+    _preloaded_panel_index = nil, -- Index of preloaded panel
 }
 
 -- Create a reusable PanelViewer class once
@@ -30,7 +33,7 @@ function PanelViewer:onTap(_, ges)
     
     local x_pct = ges.pos.x / Screen:getWidth()
     -- Determine direction based on JSON if available, else default to LTR
-    local is_rtl = self.panel_integration.reading_direction == "rtl"
+    local is_rtl = self.reading_direction == "rtl"
     
     -- Zone Logic: In RTL, Left is "Forward". In LTR, Right is "Forward".
     local is_forward = (is_rtl and x_pct < 0.3) or (not is_rtl and x_pct > 0.7)
@@ -38,37 +41,134 @@ function PanelViewer:onTap(_, ges)
 
     if is_forward then
         logger.info("PanelZoom: Forward tap detected")
-        if self.panel_integration.current_panel_index < #self.panel_integration.current_panels then
-            self.panel_integration.current_panel_index = self.panel_integration.current_panel_index + 1
-            self.panel_integration:displayCurrentPanel()
-        else
-            -- Last panel reached, jump to next page
-            logger.info("PanelZoom: Last panel reached, jumping to next page")
-            self.panel_integration:changePage(1) 
-        end
+        if self.onNext then self.onNext() end
         return true
     elseif is_backward then
         logger.info("PanelZoom: Backward tap detected")
-        if self.panel_integration.current_panel_index > 1 then
-            self.panel_integration.current_panel_index = self.panel_integration.current_panel_index - 1
-            self.panel_integration:displayCurrentPanel()
-        else
-            -- First panel reached, jump to previous page
-            logger.info("PanelZoom: First panel reached, jumping to previous page")
-            self.panel_integration:changePage(-1)
-        end
+        if self.onPrev then self.onPrev() end
         return true
     end
 
     -- Center tap: Close the viewer
     logger.info("PanelZoom: Center tap detected, closing viewer")
-    UIManager:close(self)
+    if self.onClose then self.onClose() end
     return true
 end
 
 function PanelZoomIntegration:init()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+end
+
+-- Callback methods for PanelViewer
+function PanelZoomIntegration:nextPanel()
+    -- Check if we have preloaded the next panel
+    if self._preloaded_image and self._preloaded_panel_index == self.current_panel_index + 1 then
+        -- Use preloaded image for instant switch
+        logger.info("PanelZoom: Using preloaded panel for instant switch")
+        self.current_panel_index = self.current_panel_index + 1
+        self:displayPreloadedPanel()
+        return
+    end
+    
+    if self.current_panel_index < #self.current_panels then
+        self.current_panel_index = self.current_panel_index + 1
+        self:displayCurrentPanel()
+    else
+        -- Last panel reached, jump to next page
+        logger.info("PanelZoom: Last panel reached, jumping to next page")
+        self:changePage(1) 
+    end
+end
+
+function PanelZoomIntegration:prevPanel()
+    if self.current_panel_index > 1 then
+        self.current_panel_index = self.current_panel_index - 1
+        self:displayCurrentPanel()
+    else
+        -- First panel reached, jump to previous page
+        logger.info("PanelZoom: First panel reached, jumping to previous page")
+        self:changePage(-1)
+    end
+end
+
+function PanelZoomIntegration:closeViewer()
+    UIManager:close(self._current_imgviewer)
+    self._current_imgviewer = nil
+    self:cleanupPreloadedImage()
+end
+
+-- Preload the next panel in background
+function PanelZoomIntegration:preloadNextPanel()
+    -- Clean up any existing preloaded image
+    self:cleanupPreloadedImage()
+    
+    -- Check if there's a next panel to preload
+    if self.current_panel_index < #self.current_panels then
+        local next_panel_index = self.current_panel_index + 1
+        local next_panel = self.current_panels[next_panel_index]
+        
+        if next_panel then
+            logger.info(string.format("PanelZoom: Preloading panel %d in background", next_panel_index))
+            
+            local page = self:getSafePageNumber()
+            local dim = self.ui.document:getNativePageDimensions(page)
+            
+            if dim then
+                local rect = {
+                    x = math.floor((next_panel.x or 0) * dim.w),
+                    y = math.floor((next_panel.y or 0) * dim.h),
+                    w = math.ceil((next_panel.w or 1) * dim.w),
+                    h = math.ceil((next_panel.h or 1) * dim.h)
+                }
+                
+                -- Render the next panel
+                local image = self.ui.document:drawPagePart(page, rect, 0)
+                if image then
+                    self._preloaded_image = image
+                    self._preloaded_panel_index = next_panel_index
+                    logger.info("PanelZoom: Successfully preloaded next panel")
+                else
+                    logger.warn("PanelZoom: Failed to preload next panel")
+                end
+            end
+        end
+    end
+end
+
+-- Display preloaded panel instantly
+function PanelZoomIntegration:displayPreloadedPanel()
+    if not self._preloaded_image or not self._current_imgviewer then
+        logger.warn("PanelZoom: No preloaded image or viewer available")
+        return false
+    end
+    
+    logger.info("PanelZoom: Displaying preloaded panel instantly")
+    
+    -- Update existing viewer with preloaded image
+    self._current_imgviewer.image = self._preloaded_image
+    self._current_imgviewer:update()
+    UIManager:setDirty(self._current_imgviewer, "ui")
+    
+    -- Clear preloaded image after use
+    self._preloaded_image = nil
+    self._preloaded_panel_index = nil
+    
+    -- Start preloading the next panel
+    UIManager:scheduleIn(0.1, function()
+        self:preloadNextPanel()
+    end)
+    
+    return true
+end
+
+-- Clean up preloaded image to prevent memory leaks
+function PanelZoomIntegration:cleanupPreloadedImage()
+    if self._preloaded_image then
+        logger.info("PanelZoom: Cleaning up preloaded image")
+        self._preloaded_image = nil
+        self._preloaded_panel_index = nil
+    end
 end
 
 function PanelZoomIntegration:handleEvent(ev)
@@ -139,6 +239,10 @@ function PanelZoomIntegration:changePage(diff)
         local new_page = self:getSafePageNumber()
         logger.info(string.format("PanelZoom: Changed to page %d (diff: %d)", new_page, diff))
         self.last_page_seen = new_page
+        
+        -- Clear preloaded cache after page is fully loaded to prevent conflicts
+        self:cleanupPreloadedImage()
+        
         self:importToggleZoomPanels()
         
         if #self.current_panels > 0 then
@@ -235,6 +339,37 @@ function PanelZoomIntegration:importToggleZoomPanels()
     local doc_path = self.ui.document.file
     if not doc_path then return end
     
+    -- Check cache first
+    if self._panel_cache[doc_path] then
+        logger.info("PanelZoom: Using cached JSON for " .. doc_path)
+        local cached_data = self._panel_cache[doc_path]
+        self.reading_direction = cached_data.reading_direction or "ltr"
+        
+        local page_idx = self:getSafePageNumber()
+        local panels = nil
+        
+        -- Find panels for current page from cached data
+        if cached_data.pages and type(cached_data.pages) == "table" and #cached_data.pages > 0 then
+            for _, page_data in ipairs(cached_data.pages) do
+                if page_data.page == page_idx then
+                    panels = page_data.panels
+                    logger.info(string.format("PanelZoom: Found page %d in cached data", page_idx))
+                    break
+                end
+            end
+        end
+        
+        if panels and #panels > 0 then
+            self.current_panels = panels
+            logger.info(string.format("PanelZoom: SUCCESS! Loaded %d panels from cache for page %d", #panels, page_idx))
+        else
+            self.current_panels = {}
+            logger.warn(string.format("PanelZoom: Cache found, but no panels match page %d", page_idx))
+        end
+        return
+    end
+    
+    -- Not in cache, load from file
     local dir, filename = util.splitFilePathName(doc_path)
     local base_name = filename:match("(.+)%..+$") or filename
     local json_path = dir .. "/" .. base_name .. ".json"
@@ -250,6 +385,10 @@ function PanelZoomIntegration:importToggleZoomPanels()
     
     local ok, data = pcall(json.decode, content)
     if not ok or not data then return end
+
+    -- Cache the parsed JSON
+    self._panel_cache[doc_path] = data
+    logger.info("PanelZoom: Cached JSON for " .. doc_path)
 
     -- Save the reading direction for the Tap handler
     self.reading_direction = data.reading_direction or "ltr"
@@ -349,9 +488,22 @@ function PanelZoomIntegration:displayCurrentPanel()
     if self._current_imgviewer then
         -- Update existing viewer to avoid flicker
         logger.info("PanelZoom: Updating existing ImageViewer")
+        
+        -- Explicitly free old image memory for safety
+        local old_image = self._current_imgviewer.image
         self._current_imgviewer.image = image
+        if old_image and old_image.free then 
+            old_image:free() 
+            logger.info("PanelZoom: Explicitly freed old image memory")
+        end
+        
         self._current_imgviewer:update()
         UIManager:setDirty(self._current_imgviewer, "ui")
+        
+        -- Start preloading the next panel after a short delay
+        UIManager:scheduleIn(0.2, function()
+            self:preloadNextPanel()
+        end)
     else
         -- Create new viewer
         logger.info("PanelZoom: Creating PanelViewer instance")
@@ -361,13 +513,21 @@ function PanelZoomIntegration:displayCurrentPanel()
             with_title_bar = false,
             fullscreen = true,
             buttons_visible = false, -- Hide buttons to avoid conflicts
-            panel_integration = self, -- Pass reference to the integration
+            reading_direction = self.reading_direction, -- Pass reading direction
+            onNext = function() self:nextPanel() end, -- Callback for next panel
+            onPrev = function() self:prevPanel() end, -- Callback for previous panel
+            onClose = function() self:closeViewer() end, -- Callback for close
         }
         
         self._current_imgviewer = imgviewer
         logger.info("PanelZoom: Showing ImageViewer")
         UIManager:show(imgviewer)
         logger.info("PanelZoom: ImageViewer shown successfully")
+        
+        -- Start preloading the next panel after a short delay
+        UIManager:scheduleIn(0.2, function()
+            self:preloadNextPanel()
+        end)
     end
     
     return true
