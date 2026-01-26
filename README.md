@@ -24,7 +24,7 @@ To ensure the plugin works correctly, apply the following settings:
 
 ### 2. Linux Setup (Kumiko Helper)
 
-To process manga files on Linux, install the necessary dependencies and the Kumiko engine:
+To process manga files on Linux, install the necessary dependencies and the Kumiko (fork):
 
 ```bash
 # Ubuntu/Debian
