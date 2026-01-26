@@ -133,6 +133,3 @@ The JSON file must be named identically to the manga file (e.g., `manga.cbz` and
 * **No Panels Found:** Ensure the JSON file is in the same directory as the manga and the filenames match exactly.
 * **Import Errors (cv2):** Re-run the dependency installation commands for `opencv-python`.
 
----
-
-Would you like me to update the `process_manga.py` logic to handle specifically large files or colored manga more efficiently?
