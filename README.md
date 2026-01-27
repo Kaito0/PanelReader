@@ -21,6 +21,7 @@ Avaliable detection algoritmms:
 * Kumiko - fastest, cpu
 * YOLO - min 1050 ti 4gb - CUDA*
 * MAGI - min 1050 ti 4gb - CUDA*
+
 NVIDIA Driver: Version 530+ (for CUDA 12 support).
 CUDA Toolkit: 11.8 for older cards like the 1050 Ti
 
