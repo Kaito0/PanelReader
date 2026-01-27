@@ -12,7 +12,7 @@ from huggingface_hub import hf_hub_download
 
 def get_model():
     """Downloads model if not present locally, then returns YOLO instance."""
-    model_name = "best.pt"
+    model_name = "v2023.12.07_l_yv11/model.pt"
     local_dir = "./models" # You can change this to any persistent directory
     local_path = os.path.join(local_dir, model_name)
 
@@ -21,7 +21,7 @@ def get_model():
         os.makedirs(local_dir, exist_ok=True)
         # This downloads to local_dir and returns the path
         path = hf_hub_download(
-            repo_id="mosesb/best-comic-panel-detection", 
+            repo_id="deepghs/manga109_yolo", 
             filename=model_name,
             local_dir=local_dir
         )
