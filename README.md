@@ -2,18 +2,6 @@
 
 A panel-to-panel navigation system for KOReader that provides automated transitions between manga panels. It supports both Western (LTR) and Japanese (RTL) reading directions.
 
-**Warning:** Tested on Linux and Kindle Paperwhite. Kumiko and helper processes for manga functionality are not fully tested under Windows or macOS.
-
----
-
-## Required KOReader Settings
-
-To ensure the plugin works correctly, apply the following settings:
-
-* **Zoom:** Fit full page
-  
----
-
 ## Available detection algorithms:
 
 * Kumiko - opencv, cpu - fast, simple layouts
