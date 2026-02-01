@@ -1,20 +1,28 @@
 # PanelReader for KOReader
 
-A panel-to-panel navigation system for KOReader that provides automated transitions between manga panels. It supports both Western (LTR) and Japanese (RTL) reading directions.
+KOReader-native Guided View, adapted for:
 
-**Warning:** Tested on Linux and Kindle Paperwhite. Kumiko and helper processes for manga functionality are not fully tested under Windows or macOS.
+* Open formats
 
----
+* E-ink 
+
+* Performance
+
+## Available detection algorithms:
+
+* Kumiko - opencv, cpu - fast, simple layouts
+* YOLO - min 1050 ti 4gb - CUDA*
+* MAGI - min 1050 ti 4gb - CUDA* 
+
+NVIDIA Driver: Version 530+ (for CUDA 12 support).
+CUDA Toolkit: 11.8 for older cards like the 1050 Ti
 
 ## Required KOReader Settings
 
 To ensure the plugin works correctly, apply the following settings:
 
 * **Zoom:** Fit full page
-* **Bottom Bar:** No info shown
-* **Margins:** Do not crop
-
----
+* **Page Crop:** none
 
 ## Installation
 
@@ -132,4 +140,3 @@ The JSON file must be named identically to the manga file (e.g., `manga.cbz` and
 * **ImportError (PIL/Pillow):** Ensure you ran `pip install Pillow`.
 * **No Panels Found:** Ensure the JSON file is in the same directory as the manga and the filenames match exactly.
 * **Import Errors (cv2):** Re-run the dependency installation commands for `opencv-python`.
-
