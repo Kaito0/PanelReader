@@ -6,7 +6,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local Screen = require("device").screen
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local ImageViewer = require("ui/widget/imageviewer")
+local PanelViewer = require("panel_viewer")
 local _ = require("gettext")
 local logger = require("logger")
 local util = require("util")
@@ -25,36 +25,6 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _preloaded_panel_index = nil, -- Index of preloaded panel
     _is_switching = false, -- Debounce guard to prevent fast tap issues
 }
-
--- Create a reusable PanelViewer class once
-local PanelViewer = ImageViewer:extend{}
-
-function PanelViewer:onTap(_, ges)
-    if not ges or not ges.pos then return false end
-    
-    local x_pct = ges.pos.x / Screen:getWidth()
-    -- Determine direction based on JSON if available, else default to LTR
-    local is_rtl = self.reading_direction == "rtl"
-    
-    -- Zone Logic: In RTL, Left is "Forward". In LTR, Right is "Forward".
-    local is_forward = (is_rtl and x_pct < 0.3) or (not is_rtl and x_pct > 0.7)
-    local is_backward = (is_rtl and x_pct > 0.7) or (not is_rtl and x_pct < 0.3)
-
-    if is_forward then
-        logger.info("PanelZoom: Forward tap detected")
-        if self.onNext then self.onNext() end
-        return true
-    elseif is_backward then
-        logger.info("PanelZoom: Backward tap detected")
-        if self.onPrev then self.onPrev() end
-        return true
-    end
-
-    -- Center tap: Close the viewer
-    logger.info("PanelZoom: Center tap detected, closing viewer")
-    if self.onClose then self.onClose() end
-    return true
-end
 
 function PanelZoomIntegration:init()
     self:onDispatcherRegisterActions()
@@ -136,12 +106,8 @@ function PanelZoomIntegration:preloadNextPanel()
             local dim = self.ui.document:getNativePageDimensions(page)
             
             if dim then
-                local rect = {
-                    x = math.floor((next_panel.x or 0) * dim.w),
-                    y = math.floor((next_panel.y or 0) * dim.h),
-                    w = math.ceil((next_panel.w or 1) * dim.w),
-                    h = math.ceil((next_panel.h or 1) * dim.h)
-                }
+                -- Use helper function for center-preserving quantization
+                local rect = self:panelToRect(next_panel, dim)
                 
                 -- Render the next panel with document settings
                 local image, rotate = self:drawPagePartWithSettings(page, rect)
@@ -166,8 +132,8 @@ function PanelZoomIntegration:displayPreloadedPanel()
     
     logger.info("PanelZoom: Displaying preloaded panel instantly")
     
-    -- Update existing viewer with preloaded image
-    self._current_imgviewer.image = self._preloaded_image
+    -- Update existing viewer with preloaded image using PanelViewer's method
+    self._current_imgviewer:updateImage(self._preloaded_image)
     self._current_imgviewer:update()
     UIManager:setDirty(self._current_imgviewer, "ui")
     
@@ -190,23 +156,32 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect)
     local gamma = self.ui.view.state.gamma or doc_cfg.gamma or 1.0
     local contrast = doc_cfg.contrast or 1.0
     
-    -- 2. Setup scaling/rotation (Keep your existing logic)
-    local CanvasContext = require("document/canvascontext")
-    local canvas_size = CanvasContext:getSize()
-    local rotate = false
-    if G_reader_settings:isTrue("imageviewer_rotate_auto_for_best_fit") then
-        rotate = (canvas_size.w > canvas_size.h) ~= (rect.w > rect.h)
-    end
-    local zoom = rotate and math.min(canvas_size.w / rect.h, canvas_size.h / rect.w) 
-                        or math.min(canvas_size.w / rect.w, canvas_size.h / rect.w)
+    -- 2. OPTIMIZATION: Render at SCREEN RESOLUTION for 1:1 blitting
+    -- Calculate the scale needed to fit the panel to screen
+    local Screen = require("device").screen
+    local screen_w = Screen:getWidth()
+    local screen_h = Screen:getHeight()
+    
+    -- Calculate scale to fit panel to screen while maintaining aspect ratio
+    local scale_w = screen_w / rect.w
+    local scale_h = screen_h / rect.h
+    local final_scale = math.min(scale_w, scale_h)
+    
+    -- Calculate final display size on screen
+    local display_w = math.floor(rect.w * final_scale)
+    local display_h = math.floor(rect.h * final_scale)
+    
+    -- OPTIMIZED: Render directly at final screen size
+    -- This eliminates post-scaling blur and improves performance
+    local zoom = final_scale
     
     local geom_rect = Geom:new(rect)
     local scaled_rect = geom_rect:copy()
     scaled_rect:transformByScale(zoom, zoom)
     rect.scaled_rect = scaled_rect
     
-    -- 3. Render the base image
-    -- Note: Passing gamma here handles it at the engine level if supported
+    -- 3. Render the base image at FINAL SCREEN SIZE
+    -- BEST: No post-scaling needed - perfect 1:1 blitting
     local tile = self.ui.document:renderPage(pageno, rect, zoom, 0, gamma, true)
     local image = tile.bb
     
@@ -223,9 +198,12 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect)
             image:invert()
             logger.info("PanelZoom: Applied image inversion")
         end
+        
+        logger.info(string.format("PanelZoom: Rendered at final size %dx%d (scale=%.3f) - 1:1 blit ready", 
+            display_w, display_h, final_scale))
     end
 
-    return image, rotate
+    return image, false  -- No rotation needed for 1:1 blitting
 end
 
 -- Apply KOReader's contrast and gamma settings to image buffer
@@ -616,6 +594,48 @@ function PanelZoomIntegration:loadChapterBasedPanels(master_data, dir, base_name
     end
 end
 
+function PanelZoomIntegration:panelToRect(panel, dim)
+    -- Convert panel coordinates to rect with center-preserving quantization
+    local cx = (panel.x + panel.w / 2) * dim.w
+    local cy = (panel.y + panel.h / 2) * dim.h
+
+    local w = math.floor(panel.w * dim.w + 0.5)
+    local h = math.floor(panel.h * dim.h + 0.5)
+
+    local x = math.floor(cx - w / 2 + 0.5)
+    local y = math.floor(cy - h / 2 + 0.5)
+
+    -- Add dynamic frame/padding based on panel coordinates and size
+    local panel_width = panel.w * dim.w
+    local panel_height = panel.h * dim.h
+    local panel_x = panel.x * dim.w
+    local panel_y = panel.y * dim.h
+    
+    -- Calculate dynamic padding based on panel size and position
+    -- Smaller panels get proportionally more padding, edge panels get less
+    local base_padding = math.min(panel_width, panel_height) * 0.05  -- 5% of smaller dimension
+    base_padding = math.max(1.0, math.min(2.0, base_padding))  -- Clamp between 2-15px
+    
+    -- Reduce padding near edges to avoid going out of bounds
+    local left_padding = math.min(0.2, panel_x)
+    local right_padding = math.min(2.0, dim.w - (panel_x + panel_width))
+    local top_padding = math.min(0, panel_y)
+    local bottom_padding = math.min(2, dim.h - (panel_y + panel_height))
+    
+    -- Apply calculated padding
+    x = x - left_padding
+    y = y - top_padding
+    w = w + left_padding + right_padding
+    h = h + top_padding + bottom_padding
+
+    return {
+        x = x,
+        y = y,
+        w = w,
+        h = h
+    }
+end
+
 function PanelZoomIntegration:displayCurrentPanel()
     logger.info("PanelZoom: displayCurrentPanel called")
     local panel = self.current_panels[self.current_panel_index]
@@ -626,41 +646,18 @@ function PanelZoomIntegration:displayCurrentPanel()
 
     local page = self:getSafePageNumber()
     
-    -- Get dimensions from the View object for perfect alignment
-    local view = self.ui.view
-    local doc_w, doc_h
-    
-    if view and view.page_visible and view.page_visible.area then
-        -- Use the actual view area dimensions
-        local view_area = view.page_visible.area
-        doc_w, doc_h = view_area.w, view_area.h
-        logger.info(string.format("PanelZoom: Using View area dimensions - w:%d, h:%d", doc_w, doc_h))
-    else
-        -- Fallback to document dimensions
-        local dim = self.ui.document:getNativePageDimensions(page) or self.ui.document:getPageSize(page)
-        if not dim then 
-            logger.warn("PanelZoom: Could not get page dimensions")
-            return false 
-        end
-        doc_w, doc_h = dim.w, dim.h
-        logger.info(string.format("PanelZoom: Using document dimensions - w:%d, h:%d", doc_w, doc_h))
+    -- Get dimensions from document for consistent coordinate space
+    local dim = self.ui.document:getNativePageDimensions(page) or self.ui.document:getPageSize(page)
+    if not dim then 
+        logger.warn("PanelZoom: Could not get page dimensions")
+        return false 
     end
+    logger.info(string.format("PanelZoom: Using document dimensions - w:%d, h:%d", dim.w, dim.h))
 
-    local rect = {
-        x = math.floor((panel.x or 0) * doc_w),
-        y = math.floor((panel.y or 0) * doc_h),
-        w = math.ceil((panel.w or 1) * doc_w),
-        h = math.ceil((panel.h or 1) * doc_h)
-    }
+    -- Use helper function for center-preserving quantization with dynamic frame
+    local rect = self:panelToRect(panel, dim)
     
     logger.info(string.format("PanelZoom: Panel rect - x:%d, y:%d, w:%d, h:%d", rect.x, rect.y, rect.w, rect.h))
-    
-    -- Close previous viewer BEFORE creating new image to avoid memory issues
-    if self._current_imgviewer then 
-        logger.info("PanelZoom: Closing previous ImageViewer")
-        UIManager:close(self._current_imgviewer)
-        self._current_imgviewer = nil
-    end
     
     -- Create new image for the panel with document settings
     local image, rotate = self:drawPagePartWithSettings(page, rect)
@@ -671,70 +668,36 @@ function PanelZoomIntegration:displayCurrentPanel()
     
     logger.info("PanelZoom: Successfully created panel image with document settings")
 
-    -- ALWAYS prioritize updating the existing instance for smooth transitions
-    if self._current_imgviewer then
-        -- Update existing viewer to avoid flicker and maintain state
-        logger.info("PanelZoom: Updating existing ImageViewer")
-        
-        -- Explicitly free old image memory for safety
-        local old_image = self._current_imgviewer.image
-        self._current_imgviewer.image = image
-        if old_image and old_image.free then 
-            old_image:free() 
-            logger.info("PanelZoom: Explicitly freed old image memory")
-        end
-        
-        -- Ensure the ImageViewer has proper dimen for the new image
-        if image and image.w and image.h then
-            self._current_imgviewer.dimen = Geom:new{
-                x = 0,
-                y = 0,
-                w = image.w,
-                h = image.h
-            }
-            logger.info(string.format("PanelZoom: Updated ImageViewer dimen to %dx%d", image.w, image.h))
-        end
-        
-        -- Update the viewer and mark for repaint
-        self._current_imgviewer:update()
-        UIManager:setDirty(self._current_imgviewer, "ui")
-        
-        -- Start preloading the next panel after a short delay
-        UIManager:scheduleIn(0.2, function()
-            self:preloadNextPanel()
-        end)
-        
-        logger.info("PanelZoom: Successfully updated existing ImageViewer")
-        return true -- Success, existing viewer updated
-    else
-        -- Only create new viewer if absolutely necessary
-        logger.info("PanelZoom: Creating new PanelViewer instance (no existing viewer)")
-        local imgviewer = PanelViewer:new{
-            image = image,
-            image_disposable = false, -- Don't dispose memory at all
-            with_title_bar = false,
-            fullscreen = true,
-            buttons_visible = false, -- Hide buttons to avoid conflicts
-            reading_direction = self.reading_direction, -- Pass reading direction
-            onNext = function() self:nextPanel() end, -- Callback for next panel
-            onPrev = function() self:prevPanel() end, -- Callback for previous panel
-            onClose = function() self:closeViewer() end, -- Callback for close
-        }
-        
-        self._current_imgviewer = imgviewer
-        logger.info("PanelZoom: Showing new ImageViewer")
-        UIManager:show(imgviewer)
-        logger.info("PanelZoom: New ImageViewer shown successfully")
-        
-        -- Start preloading the next panel after a short delay
-        UIManager:scheduleIn(0.2, function()
-            self:preloadNextPanel()
-        end)
-        
-        return true -- Success, new viewer created
+    -- Close previous viewer BEFORE creating new image to avoid memory issues
+    if self._current_imgviewer then 
+        logger.info("PanelZoom: Closing previous PanelViewer")
+        UIManager:close(self._current_imgviewer)
+        self._current_imgviewer = nil
     end
     
-    return true
+    -- Create new PanelViewer instance with our custom implementation
+    logger.info("PanelZoom: Creating new PanelViewer instance")
+    local panel_viewer = PanelViewer:new{
+        image = image,
+        fullscreen = true,
+        buttons_visible = false,
+        reading_direction = self.reading_direction,
+        onNext = function() self:nextPanel() end,
+        onPrev = function() self:prevPanel() end,
+        onClose = function() self:closeViewer() end,
+    }
+    
+    self._current_imgviewer = panel_viewer
+    logger.info("PanelZoom: Showing new PanelViewer")
+    UIManager:show(panel_viewer)
+    logger.info("PanelZoom: New PanelViewer shown successfully")
+    
+    -- Start preloading the next panel after a short delay
+    UIManager:scheduleIn(0.2, function()
+        self:preloadNextPanel()
+    end)
+    
+    return true -- Success, new viewer created
 end
 
 return PanelZoomIntegration
