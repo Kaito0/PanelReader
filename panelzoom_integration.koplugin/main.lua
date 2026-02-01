@@ -27,7 +27,9 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _original_panel_zoom_handler = nil, -- Store original panel zoom handler
     _original_ocr_handler = nil, -- Store original OCR handler
     _original_ocr_menu_enabled = nil, -- Store original OCR menu state
+    _original_genPanelZoomMenu = nil, -- Store original panel zoom menu function
     _json_available = false, -- Track if JSON is available for current document
+    reading_direction_override = nil, -- User override for reading direction (rtl/ltr)
 }
 
 function PanelZoomIntegration:init()
@@ -50,6 +52,17 @@ function PanelZoomIntegration:init()
             self:displayCurrentPanel()
         end
     end
+    
+    -- Integrate with existing panel zoom menu
+    self:setupPanelZoomMenuIntegration()
+end
+
+-- Get effective reading direction (override takes precedence over JSON)
+function PanelZoomIntegration:getEffectiveReadingDirection()
+    if self.reading_direction_override then
+        return self.reading_direction_override
+    end
+    return self.reading_direction or "ltr"
 end
 
 -- Check if JSON is available and integrate with Panel Zoom automatically
@@ -127,6 +140,9 @@ function PanelZoomIntegration:restoreOriginalPanelZoom()
     
     -- Restore OCR when Panel Zoom integration is disabled
     self:restoreOCR()
+    
+    -- Restore original panel zoom menu
+    self:restorePanelZoomMenu()
 end
 
 -- Block OCR functionality when Panel Zoom is active
@@ -862,7 +878,7 @@ function PanelZoomIntegration:displayCurrentPanel()
         image = image,
         fullscreen = true,
         buttons_visible = false,
-        reading_direction = self.reading_direction,
+        reading_direction = self:getEffectiveReadingDirection(),
         onNext = function() self:nextPanel() end,
         onPrev = function() self:prevPanel() end,
         onClose = function() 
@@ -891,6 +907,81 @@ function PanelZoomIntegration:displayCurrentPanel()
     end)
     
     return true -- Success, new viewer created
+end
+
+-- Integrate reading direction options into existing panel zoom menu
+function PanelZoomIntegration:setupPanelZoomMenuIntegration()
+    -- Store original genPanelZoomMenu function
+    if not self._original_genPanelZoomMenu and self.ui.highlight and self.ui.highlight.genPanelZoomMenu then
+        self._original_genPanelZoomMenu = self.ui.highlight.genPanelZoomMenu
+        
+        -- Override genPanelZoomMenu to include our reading direction options
+        self.ui.highlight.genPanelZoomMenu = function()
+            local menu_items = self._original_genPanelZoomMenu(self.ui.highlight)
+            
+            -- Add reading direction submenu at the beginning
+            table.insert(menu_items, 1, {
+                text = _("Reading Direction"),
+                sub_item_table = {
+                    {
+                        text = _("Auto (from JSON)"),
+                        checked_func = function()
+                            return self.reading_direction_override == nil
+                        end,
+                        callback = function()
+                            self.reading_direction_override = nil
+                            logger.info("PanelZoom: Reading direction set to Auto (from JSON)")
+                            self:refreshCurrentPanelIfActive()
+                        end,
+                    },
+                    {
+                        text = _("Left-to-Right (LTR)"),
+                        checked_func = function()
+                            return self.reading_direction_override == "ltr"
+                        end,
+                        callback = function()
+                            self.reading_direction_override = "ltr"
+                            logger.info("PanelZoom: Reading direction override set to LTR")
+                            self:refreshCurrentPanelIfActive()
+                        end,
+                    },
+                    {
+                        text = _("Right-to-Left (RTL)"),
+                        checked_func = function()
+                            return self.reading_direction_override == "rtl"
+                        end,
+                        callback = function()
+                            self.reading_direction_override = "rtl"
+                            logger.info("PanelZoom: Reading direction override set to RTL")
+                            self:refreshCurrentPanelIfActive()
+                        end,
+                    },
+                },
+                separator = true,
+            })
+            
+            return menu_items
+        end
+        
+        logger.info("PanelZoom: Integrated reading direction options into panel zoom menu")
+    end
+end
+
+-- Restore original panel zoom menu when plugin is disabled
+function PanelZoomIntegration:restorePanelZoomMenu()
+    if self._original_genPanelZoomMenu and self.ui.highlight then
+        self.ui.highlight.genPanelZoomMenu = self._original_genPanelZoomMenu
+        self._original_genPanelZoomMenu = nil
+        logger.info("PanelZoom: Restored original panel zoom menu")
+    end
+end
+
+-- Refresh current panel if viewer is active (for reading direction changes)
+function PanelZoomIntegration:refreshCurrentPanelIfActive()
+    if self._current_imgviewer and self.integration_mode and #self.current_panels > 0 then
+        logger.info("PanelZoom: Refreshing panel viewer with new reading direction")
+        self:displayCurrentPanel()
+    end
 end
 
 return PanelZoomIntegration

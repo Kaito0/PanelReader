@@ -91,10 +91,13 @@ function PanelViewer:loadImage()
     if self.image then
         image_bb = self.image
         logger.info("PanelViewer: Using provided BlitBuffer")
-    -- Load from file with dithering enabled for E-ink optimization
+    -- Load from file with screen-size decoding for sharp rendering
     elseif self.file then
-        logger.info(string.format("PanelViewer: Loading image from file with dithering: %s", self.file))
-        image_bb = RenderImage:renderImageFile(self.file, false) -- true enables dithering
+        local screen_w = Screen:getWidth()
+        local screen_h = Screen:getHeight()
+        logger.info(string.format("PanelViewer: Loading image file at screen size %dx%d with dithering: %s", screen_w, screen_h, self.file))
+        -- Pass screen dimensions to MuPDF for high-quality scaling during decode
+        image_bb = RenderImage:renderImageFile(self.file, false, screen_w, screen_h)
         if not image_bb then
             logger.error("PanelViewer: Failed to load image file")
             return false
