@@ -2,11 +2,11 @@
 
 KOReader-native Guided View, adapted for:
 
-* open formats
+* Open formats
 
-* e-ink 
+* E-ink 
 
-* performance
+* Performance
 
 ## Available detection algorithms:
 
