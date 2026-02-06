@@ -30,7 +30,7 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _original_genPanelZoomMenu = nil, -- Store original panel zoom menu function
     _json_available = false, -- Track if JSON is available for current document
     reading_direction_override = nil, -- User override for reading direction (rtl/ltr)
-    bayer_dithering_enabled = true, -- Toggle between Bayer and built-in dithering
+    horizontal_offset = 0,
 }
 
 function PanelZoomIntegration:init()
@@ -77,20 +77,12 @@ function PanelZoomIntegration:checkAndIntegratePanelZoom()
     local dir, filename = util.splitFilePathName(doc_path)
     local base_name = filename:match("(.+)%..+$") or filename
     
-    -- Check for JSON files in various locations
-    local json_paths = {
-        dir .. "/" .. base_name .. ".json",           -- Same directory as document
-        dir .. "/panel_result/" .. base_name .. ".json",  -- panel_result directory
-        dir .. "/../panel_result/" .. base_name .. ".json", -- Parent panel_result directory
-    }
+    -- Check for JSON file in same directory as document
+    local json_path = dir .. "/" .. base_name .. ".json"
+    local json_found = util.pathExists(json_path)
     
-    local json_found = false
-    for _, json_path in ipairs(json_paths) do
-        if util.pathExists(json_path) then
-            logger.info("PanelZoom: Found JSON file at " .. json_path)
-            json_found = true
-            break
-        end
+    if json_found then
+        logger.info("PanelZoom: Found JSON file at " .. json_path)
     end
     
     if json_found then
@@ -111,6 +103,11 @@ function PanelZoomIntegration:integrateWithPanelZoom()
     -- Store the original handler if not already stored
     if not self._original_panel_zoom_handler then
         self._original_panel_zoom_handler = self.ui.highlight.onPanelZoom
+    end
+    
+    -- Store the original panel zoom enabled state
+    if self._original_panel_zoom_enabled == nil then
+        self._original_panel_zoom_enabled = self.ui.highlight.panel_zoom_enabled
     end
     
     -- Override Panel Zoom to use our JSON when available
@@ -136,8 +133,12 @@ function PanelZoomIntegration:restoreOriginalPanelZoom()
         self.ui.highlight.onPanelZoom = nil
     end
     
+    -- Restore the original panel zoom enabled state
+    if self._original_panel_zoom_enabled ~= nil then
+        self.ui.highlight.panel_zoom_enabled = self._original_panel_zoom_enabled
+    end
+    
     self.integration_mode = false
-    if self.ui.highlight then self.ui.highlight.panel_zoom_enabled = false end
     
     -- Restore OCR when Panel Zoom integration is disabled
     self:restoreOCR()
@@ -172,6 +173,11 @@ end
 
 -- Restore OCR functionality when Panel Zoom is disabled
 function PanelZoomIntegration:restoreOCR()
+    -- Guard against multiple restoration calls
+    if not self._original_ocr_handler and (self._original_ocr_menu_enabled == nil) then
+        return -- Already restored or never stored
+    end
+    
     -- Restore original OCR handler
     if self.ui.ocr and self._original_ocr_handler then
         self.ui.ocr.onOCRText = self._original_ocr_handler
@@ -258,14 +264,21 @@ function PanelZoomIntegration:preloadNextPanel()
             local dim = self.ui.document:getNativePageDimensions(page)
             
             if dim then
+                -- Calculate and log panel center coordinates for preloaded panel
+                local center = self:calculatePanelCenter(next_panel, dim)
+                
                 -- Use helper function for center-preserving quantization
                 local rect = self:panelToRect(next_panel, dim)
                 
                 -- Render the next panel with document settings
-                local image, rotate = self:drawPagePartWithSettings(page, rect)
+                local image, rotate, custom_position = self:drawPagePartWithSettings(page, rect, center, next_panel, dim)
+                -- Store preloaded image with panel data for proper centering
                 if image then
                     self._preloaded_image = image
                     self._preloaded_panel_index = next_panel_index
+                    self._preloaded_panel = next_panel  -- Store panel data
+                    self._preloaded_dim = dim          -- Store dimensions
+                    self._preloaded_custom_position = custom_position  -- Store calculated position
                     logger.info("PanelZoom: Successfully preloaded next panel with document settings")
                 else
                     logger.warn("PanelZoom: Failed to preload next panel")
@@ -286,12 +299,36 @@ function PanelZoomIntegration:displayPreloadedPanel()
     
     -- Update existing viewer with preloaded image using PanelViewer's method
     self._current_imgviewer:updateImage(self._preloaded_image)
+    
+    -- Get screen and image dimensions
+    local Screen = require("device").screen
+    local screen_w = Screen:getWidth()
+    local screen_h = Screen:getHeight()
+    local image_w = self._preloaded_image:getWidth()
+    local image_h = self._preloaded_image:getHeight()
+    
+    -- Use the pre-calculated center-locked position instead of simple centering
+    local custom_position = self._preloaded_custom_position or {
+        x = math.floor(((screen_w - image_w) / 2) + 0.5),
+        y = math.floor(((screen_h - image_h) / 2) + 0.5),
+    }
+    
+    logger.info(string.format("PanelZoom: Using preloaded center-locked position - x:%d, y:%d (image:%dx%d, screen:%dx%d)", 
+        custom_position.x, custom_position.y, image_w, image_h, screen_w, screen_h))
+    
+    self._current_imgviewer:updateCustomPosition(custom_position)
+    logger.info(string.format("PanelZoom: Updated custom position for preloaded panel - x:%d, y:%d (image:%dx%d, screen:%dx%d)", 
+        custom_position.x, custom_position.y, image_w, image_h, screen_w, screen_h))
+    
     self._current_imgviewer:update()
     UIManager:setDirty(self._current_imgviewer, "ui")
     
-    -- Clear preloaded image after use
+    -- Clear preloaded data after use
     self._preloaded_image = nil
     self._preloaded_panel_index = nil
+    self._preloaded_panel = nil
+    self._preloaded_dim = nil
+    self._preloaded_custom_position = nil
     
     -- Start preloading the next panel
     UIManager:scheduleIn(0.1, function()
@@ -302,62 +339,79 @@ function PanelZoomIntegration:displayPreloadedPanel()
 end
 
 -- Custom drawPagePart that applies document settings
-function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect)
-    -- 1. Fetch current document settings
+function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_center, panel, dim)
+    -- 1. Document & Screen Settings
     local doc_cfg = self.ui.document.info.config or {}
     local gamma = self.ui.view.state.gamma or doc_cfg.gamma or 1.0
     local contrast = doc_cfg.contrast or 1.0
     
-    -- 2. OPTIMIZATION: Render at SCREEN RESOLUTION for 1:1 blitting
-    -- Calculate the scale needed to fit the panel to screen
     local Screen = require("device").screen
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
-    
-    -- Calculate scale to fit panel to screen while maintaining aspect ratio
-    local scale_w = screen_w / rect.w
-    local scale_h = screen_h / rect.h
+
+    -- 2. DEFINE ABSOLUTE LIMIT SAFE ZONE
+    local padding = 2
+    local safe_w = screen_w - (padding * 2)
+    local safe_h = screen_h - (padding * 2)
+
+    -- 3. CALCULATE SCALE (Must fit inside Safe Zone)
+    local scale_w = safe_w / rect.w
+    local scale_h = safe_h / rect.h
     local final_scale = math.min(scale_w, scale_h)
-    
-    -- Calculate final display size on screen
-    local display_w = math.floor(rect.w * final_scale)
-    local display_h = math.floor(rect.h * final_scale)
-    
-    -- OPTIMIZED: Render directly at final screen size
-    -- This eliminates post-scaling blur and improves performance
-    local zoom = final_scale
-    
-    local geom_rect = Geom:new(rect)
-    local scaled_rect = geom_rect:copy()
-    scaled_rect:transformByScale(zoom, zoom)
-    rect.scaled_rect = scaled_rect
-    
-    -- 3. Render the base image at FINAL SCREEN SIZE
-    -- KOADER MUFPDF LOGIC: Enable dithering for E-ink displays to prevent artifacts
-    -- KOReader enables dithering for 8bpp displays and grayscale content
-    -- For manga panels on E-ink, we need dithering to avoid banding artifacts
-    local tile = self.ui.document:renderPage(pageno, rect, zoom, 0, gamma, true)  -- true = enable dithering
-    local image = tile.bb
-    
-    -- 4. Apply Post-Processing (Contrast and Inversion)
-    if image then
-        -- Apply contrast if it's not neutral (1.0)
-        if contrast ~= 1.0 and image.contrast then
-            image:contrast(contrast)
-            logger.info(string.format("PanelZoom: Applied contrast %.2f", contrast))
+
+    -- Calculate final display dimensions
+    local display_w = math.floor(rect.w * final_scale + 0.5)
+    local display_h = math.floor(rect.h * final_scale + 0.5)
+
+    -- 4. ORIGINAL CENTERING LOGIC
+    -- We calculate the top-left to perfectly center the box on screen
+    local pos_x = (screen_w - display_w) / 2
+    local pos_y = (screen_h - display_h) / 2
+
+    -- 5. CLAMPING TO ABSOLUTE LIMITS
+    -- Forces the panel to stay at least 5px from any edge
+    local custom_position = {
+        x = math.floor(math.max(padding, math.min(pos_x, screen_w - display_w - padding)) + 0.5),
+        y = math.floor(math.max(padding, math.min(pos_y, screen_h - display_h - padding)) + 0.5)
+    }
+    -- 5b. APPLY HORIZONTAL OFFSET
+custom_position.x = custom_position.x + (self.horizontal_offset or -2)
+-- Optional: clamp to screen bounds
+
+    -- 6. ASPECT RATIO NUDGES (Original offsets)
+    if panel and dim then
+        local panel_aspect_ratio = (panel.w * dim.w) / (panel.h * dim.h)
+        if panel_aspect_ratio >= 0.67 then
+            custom_position.x = custom_position.x - 1
+        else
+            custom_position.y = custom_position.y - 0
         end
-        
-        -- Apply software inversion (Night Mode / Invert Document)
-        if doc_cfg.invert and image.invert then
-            image:invert()
-            logger.info("PanelZoom: Applied image inversion")
-        end
-        
-        logger.info(string.format("PanelZoom: Rendered at final size %dx%d (scale=%.3f) - 1:1 blit ready", 
-            display_w, display_h, final_scale))
     end
 
-    return image, false  -- No rotation needed for 1:1 blitting
+    -- 7. RENDER
+    -- Create the geometry for MuPDF
+    local geom_rect = Geom:new(rect)
+    local scaled_rect = geom_rect:copy()
+    scaled_rect:transformByScale(final_scale, final_scale)
+    rect.scaled_rect = scaled_rect
+
+    local tile = self.ui.document:renderPage(pageno, rect, final_scale, 0, gamma, true)
+    local image = tile.bb
+
+    -- 8. POST-PROCESSING
+    if image then
+        if contrast ~= 1.0 and image.contrast then
+            image:contrast(contrast)
+        end
+        if doc_cfg.invert and image.invert then
+            image:invert()
+        end
+        
+        logger.info(string.format("PanelZoom: [Safe Zone %dpx] Rendered %dx%d at (%d,%d)", 
+            padding, display_w, display_h, custom_position.x, custom_position.y))
+    end
+
+    return image, false, custom_position
 end
 
 -- Apply KOReader's contrast and gamma settings to image buffer
@@ -396,6 +450,7 @@ function PanelZoomIntegration:cleanupPreloadedImage()
         logger.info("PanelZoom: Cleaning up preloaded image")
         self._preloaded_image = nil
         self._preloaded_panel_index = nil
+        self._preloaded_custom_position = nil
     end
 end
 
@@ -701,138 +756,99 @@ function PanelZoomIntegration:loadChapterBasedPanels(master_data, dir, base_name
     end
 end
 
-function PanelZoomIntegration:panelToRect(panel, dim)
-    -- Convert panel coordinates to rect with center-preserving quantization
-    local cx = (panel.x + panel.w / 2) * dim.w
-    local cy = (panel.y + panel.h / 2) * dim.h
-
-    local w = math.floor(panel.w * dim.w + 0.5)
-    local h = math.floor(panel.h * dim.h + 0.5)
-
-    local x = math.floor(cx - w / 2 + 0.5)
-    local y = math.floor(cy - h / 2 + 0.5)
-
-    -- Add dynamic frame/padding based on panel coordinates and size
-    local panel_width = panel.w * dim.w
-    local panel_height = panel.h * dim.h
-    local panel_x = panel.x * dim.w
-    local panel_y = panel.y * dim.h
+function PanelZoomIntegration:calculatePanelCenter(panel, dim)
+    -- Calculate absolute center coordinates from panel JSON data
+    -- Center_x = x + w/2, Center_y = y + h/2
+    local center_x = panel.x + (panel.w / 2)
+    local center_y = panel.y + (panel.h / 2)
     
-    -- Calculate dynamic padding based on panel size and position
-    -- Smaller panels get proportionally more padding, edge panels get less
-    local base_padding = math.min(panel_width, panel_height) * 0.05  -- 5% of smaller dimension
-    base_padding = math.max(1.0, math.min(2.0, base_padding))  -- Clamp between 2-15px
+    -- Convert to absolute pixel coordinates
+    local abs_center_x = math.floor(center_x * dim.w + 0.5)
+    local abs_center_y = math.floor(center_y * dim.h + 0.5)
     
-    -- Calculate dynamic right padding based on panel dimensions and aspect ratio
-    local right_padding = self:calculateDynamicRightPadding(panel_width, panel_height, base_padding)
+    logger.info(string.format("PanelZoom: Panel center - normalized:(%.3f, %.3f), absolute:(%d, %d)", 
+        center_x, center_y, abs_center_x, abs_center_y))
     
-    -- Calculate dynamic left padding based on panel dimensions and aspect ratio
-    local left_padding = self:calculateDynamicLeftPadding(panel_width, panel_height, base_padding)
-    
-    -- Reduce padding near edges to avoid going out of bounds
-    left_padding = math.min(left_padding, panel_x)
-    right_padding = math.min(right_padding, dim.w - (panel_x + panel_width))
-    local top_padding = math.min(0.2, panel_y)
-    local bottom_padding = math.min(2.0, dim.h - (panel_y + panel_height))
-    
-    -- Apply calculated padding
-    x = x - left_padding
-    y = y - top_padding
-    w = w + left_padding + right_padding
-    h = h + top_padding + bottom_padding
-
     return {
-        x = x,
-        y = y,
-        w = w,
-        h = h
+        x = center_x,
+        y = center_y,
+        abs_x = abs_center_x,
+        abs_y = abs_center_y
     }
 end
 
-function PanelZoomIntegration:calculateDynamicRightPadding(panel_width, panel_height, base_padding)
-    -- Calculate aspect ratio as percentage (width/height * 100)
-    local aspect_percentage = (panel_width / panel_height) * 100
+function PanelZoomIntegration:panelToRect(panel, dim)
+    -- Step 1: Compute panel center (NO padding involved) - semantic center only
+    local panel_cx = (panel.x + panel.w / 2) * dim.w
+    local panel_cy = (panel.y + panel.h / 2) * dim.h
     
-    -- Dynamic right padding based on panel dimensions and aspect percentage
-    -- Categories based on width as percentage of height:
-    -- >300%: Very wide (5.0 padding)
-    -- 200-300%: Wide (1.0-3.0 padding based on size)
-    -- 120-200%: Slightly wide to medium (1.0-3.0 padding based on size)
-    -- 80-120%: Near square to slightly tall (1.0 padding)
-    -- <80%: Tall (1.0-2.0 padding based on height)
+    -- Step 2: Build a padded render rect (crop source)
+    -- panel rect in page pixels
+    local px = panel.x * dim.w
+    local py = panel.y * dim.h
+    local pw = panel.w * dim.w
+    local ph = panel.h * dim.h
     
-    local right_padding = base_padding
+    -- Calculate padding based on aspect ratio
+    local padding_left = 0
+    local padding_right = 0
+    local padding_top = 0
+    local padding_bottom = 0
+    local padding_x = 0
+    local padding_y = 0
     
-    -- Very wide panels (width > 300% of height) - maximum padding
-    if aspect_percentage > 300 then
-        right_padding = 5.0
-    -- Wide panels (width 200-300% of height) - variable padding based on width
-    elseif aspect_percentage > 200 then
-        if panel_width > 900 and panel_height < 650 then
-            right_padding = 3.0  -- Large wide panels
-        elseif panel_width > 300 and panel_width < 400 and panel_height > 200 and panel_height < 250 then
-            right_padding = 1.0  -- Medium wide panels like 361x236.7 (152%)
-        else
-            right_padding = 1.0  -- Other medium wide panels
-        end
-    -- Medium to slightly wide panels (width 120-200% of height) - variable padding based on dimensions
-    elseif aspect_percentage > 120 then
-        -- Special case for medium-sized slightly wide panels (like 307x252 = 122%)
-        if panel_width > 250 and panel_width < 400 and panel_height > 200 and panel_height < 300 then
-            right_padding = 3.0  -- Medium slightly wide panels
-        else
-            right_padding = 1.0  -- Other slightly wide panels
-        end
-    -- Near square to slightly tall panels (width 80-120% of height) - minimal padding
-    elseif aspect_percentage > 80 then
-        right_padding = 1.0
-    -- Tall panels (width < 80% of height) - variable padding based on height
+    local panel_aspect_ratio = pw / ph
+    
+    if panel_aspect_ratio > 1.5 then
+        -- Wide horizontal panels (action scenes, landscapes)
+        padding_left = dim.w * 0.007
+        padding_right = dim.w * 0.006
+        padding_y = dim.h * 0.004
+    elseif panel_aspect_ratio < 0.67 then
+        -- Tall vertical panels (character focus, falling scenes)
+        padding_x = dim.w * 0.004
+        padding_top = dim.h * 0.001
+        padding_bottom = dim.h * 0.002
     else
-        if panel_height > 1000 then
-            if panel_width > 750 then
-                right_padding = 1.0  -- Very tall but wide panels
-            else
-                right_padding = 2.0  -- Very tall and narrow panels
-            end
-        else
-            right_padding = base_padding  -- Default for other tall panels
-        end
+        -- Square/standard panels (dialogue, exposition)
+        padding_x = dim.w * 0.005
+        padding_top = dim.h * 0.0015
+        padding_bottom = dim.h * 0.003
     end
     
-    logger.info(string.format("PanelZoom: Dynamic right padding - %.1fx%.1f (%.0f%%) -> %.1f", 
-                panel_width, panel_height, aspect_percentage, right_padding))
+    -- Build render rect with left extension (more area on left side, less on right)
+    local left_extension = 2   -- Less extension on left side
+    local right_extension = 2 -- 4px + 5px more extension on right
+    local top_extension = 0.5
+    local bottom_extension = 2.5
     
-    return right_padding
+    local render_rect = {
+        x = px - left_extension,      -- Less cropping on left
+        y = py - top_extension,       -- Extend on top
+        w = pw + left_extension + right_extension,
+        h = ph + top_extension + bottom_extension,
+    }
+    
+    -- Clamp to page bounds
+    render_rect.w = math.min(render_rect.w, dim.w)
+    render_rect.h = math.min(render_rect.h, dim.h)
+    render_rect.x = math.max(0, math.min(render_rect.x, dim.w - render_rect.w))
+    render_rect.y = math.max(0, math.min(render_rect.y, dim.h - render_rect.h))
+    
+    logger.info(string.format("PanelZoom: Panel center:(%.1f,%.1f) render_rect:(%d,%d,%dx%d)", 
+        panel_cx, panel_cy, render_rect.x, render_rect.y, render_rect.w, render_rect.h))
+    
+    -- Return render rect and panel center for later calculations
+    return {
+        x = render_rect.x,
+        y = render_rect.y,
+        w = render_rect.w,
+        h = render_rect.h,
+        panel_cx = panel_cx,  -- Semantic center (no padding)
+        panel_cy = panel_cy   -- Semantic center (no padding)
+    }
 end
 
-function PanelZoomIntegration:calculateDynamicLeftPadding(panel_width, panel_height, base_padding)
-    -- Calculate aspect ratio as percentage (width/height * 100)
-    local aspect_percentage = (panel_width / panel_height) * 100
-    
-    -- Dynamic left padding based on panel dimensions and aspect percentage
-    -- Categories based on width as percentage of height:
-    -- 130-160%: Medium-wide panels (0.6 padding for specific size range)
-    -- Other ranges: Default 0.2 padding
-    
-    local left_padding = base_padding
-    
-    -- Special case for medium-wide panels like 361x236.7 (152%)
-    if aspect_percentage > 130 and aspect_percentage < 160 then
-        if panel_width > 300 and panel_width < 400 and panel_height > 200 and panel_height < 250 then
-            left_padding = 0.6  -- Medium wide panels like 361x236.7
-        else
-            left_padding = 0.2  -- Default for other wide panels
-        end
-    -- Default for other panels
-    else
-        left_padding = 0.2  -- Default left padding
-    end
-    
-    logger.info(string.format("PanelZoom: Dynamic left padding - %.1fx%.1f (%.0f%%) -> %.1f", 
-                panel_width, panel_height, aspect_percentage, left_padding))
-    
-    return left_padding
-end
 
 function PanelZoomIntegration:displayCurrentPanel()
     logger.info("PanelZoom: displayCurrentPanel called")
@@ -855,16 +871,28 @@ function PanelZoomIntegration:displayCurrentPanel()
     -- Use helper function for center-preserving quantization with dynamic frame
     local rect = self:panelToRect(panel, dim)
     
+    -- Calculate and log panel center coordinates
+    local center = self:calculatePanelCenter(panel, dim)
+    
     logger.info(string.format("PanelZoom: Panel rect - x:%d, y:%d, w:%d, h:%d", rect.x, rect.y, rect.w, rect.h))
     
     -- Create new image for the panel with document settings
-    local image, rotate = self:drawPagePartWithSettings(page, rect)
+    local image, rotate, custom_position = self:drawPagePartWithSettings(page, rect, center, panel, dim)
     if not image then 
         logger.warn("PanelZoom: Could not draw page part")
         return false 
     end
     
     logger.info("PanelZoom: Successfully created panel image with document settings")
+
+    -- Calculate panel aspect ratio for border logic
+    local panel_aspect_ratio = nil
+    if panel and dim then
+        local panel_w = panel.w * dim.w
+        local panel_h = panel.h * dim.h
+        panel_aspect_ratio = panel_w / panel_h
+        logger.info(string.format("PanelZoom: Panel aspect ratio: %.3f", panel_aspect_ratio))
+    end
 
     -- Close previous viewer BEFORE creating new image to avoid memory issues
     if self._current_imgviewer then 
@@ -880,7 +908,8 @@ function PanelZoomIntegration:displayCurrentPanel()
         fullscreen = true,
         buttons_visible = false,
         reading_direction = self:getEffectiveReadingDirection(),
-        bayer_dithering_enabled = self.bayer_dithering_enabled,
+        custom_position = custom_position,  -- Pass custom position for center matching
+        panel_aspect_ratio = panel_aspect_ratio,  -- Pass panel aspect ratio for border logic
         onNext = function() self:nextPanel() end,
         onPrev = function() self:prevPanel() end,
         onClose = function() 
@@ -920,6 +949,38 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
         -- Override genPanelZoomMenu to include our reading direction options
         self.ui.highlight.genPanelZoomMenu = function()
             local menu_items = self._original_genPanelZoomMenu(self.ui.highlight)
+            
+            table.insert(menu_items, 2, {  -- insert after reading direction
+    text = _("Horizontal Offset"),
+    sub_item_table = {
+        {
+            text = _("Left 1 px"),
+            callback = function()
+                self.horizontal_offset = (self.horizontal_offset or 0) - 1
+                logger.info("PanelZoom: Horizontal offset set to " .. self.horizontal_offset)
+                self:refreshCurrentPanelIfActive()
+            end
+        },
+        {
+            text = _("Right 1 px"),
+            callback = function()
+                self.horizontal_offset = (self.horizontal_offset or 0) + 1
+                logger.info("PanelZoom: Horizontal offset set to " .. self.horizontal_offset)
+                self:refreshCurrentPanelIfActive()
+            end
+        },
+        {
+            text = _("Reset"),
+            callback = function()
+                self.horizontal_offset = 0
+                logger.info("PanelZoom: Horizontal offset reset to 0")
+                self:refreshCurrentPanelIfActive()
+            end
+        }
+    },
+    separator = true,
+})
+
             
             -- Add reading direction submenu at the beginning
             table.insert(menu_items, 1, {
@@ -962,21 +1023,6 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                 separator = true,
             })
             
-            -- Add dithering mode toggle after reading direction
-            table.insert(menu_items, 2, {
-                text = _("Bayer Dithering"),
-                checked_func = function()
-                    return self.bayer_dithering_enabled
-                end,
-                callback = function()
-                    self.bayer_dithering_enabled = not self.bayer_dithering_enabled
-                    logger.info(string.format("PanelZoom: Bayer dithering %s", 
-                        self.bayer_dithering_enabled and "enabled" or "disabled (using built-in)"))
-                    self:refreshCurrentPanelIfActive()
-                end,
-                help_text = _("Toggle between custom Bayer dithering and KOReader's built-in dithering"),
-            })
-            
             return menu_items
         end
         
@@ -986,6 +1032,11 @@ end
 
 -- Restore original panel zoom menu when plugin is disabled
 function PanelZoomIntegration:restorePanelZoomMenu()
+    -- Guard against multiple restoration calls
+    if not self._original_genPanelZoomMenu then
+        return -- Already restored or never stored
+    end
+    
     if self._original_genPanelZoomMenu and self.ui.highlight then
         self.ui.highlight.genPanelZoomMenu = self._original_genPanelZoomMenu
         self._original_genPanelZoomMenu = nil
@@ -999,6 +1050,41 @@ function PanelZoomIntegration:refreshCurrentPanelIfActive()
         logger.info("PanelZoom: Refreshing panel viewer with new reading direction")
         self:displayCurrentPanel()
     end
+end
+
+-- Helper function: Calculate position to move panel center exactly to screen center
+function PanelZoomIntegration:panelCenterToScreenPosition(panel, rect, dim, zoom)
+    if not panel or not rect or not dim or not zoom then
+        logger.warn("PanelZoom: Invalid parameters in panelCenterToScreenPosition")
+        -- Fallback to screen center
+        local screen_w = Screen:getWidth()
+        local screen_h = Screen:getHeight()
+        return {
+            x = math.floor(screen_w / 2),
+            y = math.floor(screen_h / 2),
+        }
+    end
+    
+    local screen_w = Screen:getWidth()
+    local screen_h = Screen:getHeight()
+
+    -- Absolute panel center (page space) from normalized JSON coordinates
+    local panel_cx = (panel.x + panel.w / 2) * dim.w
+    local panel_cy = (panel.y + panel.h / 2) * dim.h
+
+    -- Center inside rect (page space)
+    local cx_in_rect = panel_cx - rect.x
+    local cy_in_rect = panel_cy - rect.y
+
+    -- Scaled center (screen space)
+    local cx_screen = cx_in_rect * zoom
+    local cy_screen = cy_in_rect * zoom
+
+    -- Translation to move center to screen center
+    return {
+        x = math.floor(screen_w / 2 - cx_screen + 0.5),
+        y = math.floor(screen_h / 2 - cy_screen + 0.5),
+    }
 end
 
 return PanelZoomIntegration
